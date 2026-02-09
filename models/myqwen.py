@@ -25,7 +25,7 @@ class QwenConfig:
     num_layers: int
     max_seq_len: int
     ffn_mult: int = 4
-    pos_emb_type: Literal["learned", "rope"] = "learned"
+    pos_emb_type: Literal["learned", "sinusoidal", "rope"] = "learned"
     rope_theta: float = 10000.0
 
 
@@ -57,6 +57,51 @@ class TraditionalEmbedding(nn.Module):
             raise ValueError(f"seq_len {seq_len} exceeds max_seq_len {self.max_seq_len}")
         pos = _position_ids(bsz, seq_len, device=input_ids.device)
         x = self.tok_emb(input_ids) + self.pos_emb(pos)
+        return x, pos
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """
+    Fixed (non-trainable) sinusoidal positional encoding from
+    "Attention Is All You Need" (2017).
+    """
+
+    def __init__(self, hidden_size: int, max_seq_len: int) -> None:
+        super().__init__()
+        pe = torch.zeros(max_seq_len, hidden_size, dtype=torch.float32)
+
+        position = torch.arange(0, max_seq_len, dtype=torch.float32).unsqueeze(1)  # (L, 1)
+        div_term = torch.exp(
+            torch.arange(0, hidden_size, 2, dtype=torch.float32) * (-math.log(10000.0) / hidden_size)
+        )  # (H/2,)
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe, persistent=False)  # (L, H)
+
+    def forward(self, position_ids: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+        """
+        position_ids: (batch, seq_len)
+        returns: (batch, seq_len, hidden_size)
+        """
+        return self.pe[position_ids].to(dtype=dtype)
+
+
+class SinusoidalEmbedding(nn.Module):
+    """token embedding + fixed sinusoidal absolute position encoding"""
+
+    def __init__(self, vocab_size: int, hidden_size: int, max_seq_len: int) -> None:
+        super().__init__()
+        self.tok_emb = nn.Embedding(vocab_size, hidden_size)
+        self.pos_enc = SinusoidalPositionalEncoding(hidden_size, max_seq_len)
+        self.max_seq_len = max_seq_len
+
+    def forward(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        bsz, seq_len = input_ids.shape
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"seq_len {seq_len} exceeds max_seq_len {self.max_seq_len}")
+        pos = _position_ids(bsz, seq_len, device=input_ids.device)
+        x = self.tok_emb(input_ids) + self.pos_enc(pos, dtype=self.tok_emb.weight.dtype)
         return x, pos
 
 
@@ -204,7 +249,7 @@ class QwenModel(nn.Module):
         max_seq_len: int,
         num_layers: int,
         num_heads: int = 32,
-        pos_emb_type: Literal["learned", "rope"] = "learned",
+        pos_emb_type: Literal["learned", "sinusoidal", "rope"] = "learned",
     ) -> None:
         super().__init__()
         self.config = QwenConfig(
@@ -218,6 +263,8 @@ class QwenModel(nn.Module):
 
         if pos_emb_type == "learned":
             self.embedding = TraditionalEmbedding(vocab_size, hidden_size, max_seq_len)
+        elif pos_emb_type == "sinusoidal":
+            self.embedding = SinusoidalEmbedding(vocab_size, hidden_size, max_seq_len)
         elif pos_emb_type == "rope":
             self.embedding = nn.Embedding(vocab_size, hidden_size)
         else:
@@ -238,7 +285,7 @@ class QwenModel(nn.Module):
 
         pos = _position_ids(bsz, seq_len, device=input_ids.device)
 
-        if self.config.pos_emb_type == "learned":
+        if self.config.pos_emb_type in ("learned", "sinusoidal"):
             x, _ = self.embedding(input_ids)
         else:
             x = self.embedding(input_ids)
@@ -249,4 +296,3 @@ class QwenModel(nn.Module):
 
         x = self.norm(x)
         return self.lm_head(x)
-
