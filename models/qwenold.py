@@ -21,11 +21,11 @@ class SinusoidalEmbedding(nn.Module):
         pe[:,1::2] = torch.cos(pos * div)#cos
         self.register_buffer("pe", pe, persistent=False)
     
-    def forward(self, postions_ids):
+    def forward(self, position_ids):
         """
             calculate sin/cos embedding
         """
-        return self.pe[postions_ids]
+        return self.pe[position_ids]
 
 
 class QwenConfig:
@@ -136,8 +136,8 @@ class QwenModel(nn.Module):
         bsz, seq_len = input_ids.shape
         mask = _causal_mask(seq_len, device=input_ids.device)
         x = self.transformer_embedding(input_ids)
-        postions_ids = torch.arange(0, seq_len, device=input_ids.device)
-        pos = self.position_embedding(postions_ids)
+        position_ids = torch.arange(0, seq_len, device=input_ids.device)
+        pos = self.position_embedding(position_ids)
         x = x + pos
 
         # Transformer layers
