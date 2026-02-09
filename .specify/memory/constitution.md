@@ -1,50 +1,42 @@
-# [PROJECT_NAME] Constitution
-<!-- Example: Spec Constitution, TaskFlow Constitution, etc. -->
+<!--
+Sync Impact Report:
+- Version change: undefined → 1.0.0
+- Modified principles: None (new constitution)
+- Added sections: All principles and governance sections
+- Removed sections: None
+- Templates requiring updates: ⚠ pending (plan-template.md, spec-template.md, tasks-template.md, commands/*.md)
+- Follow-up TODOs: None
+-->
+
+# SpecKit Constitution
 
 ## Core Principles
 
-### [PRINCIPLE_1_NAME]
-<!-- Example: I. Library-First -->
-[PRINCIPLE_1_DESCRIPTION]
-<!-- Example: Every feature starts as a standalone library; Libraries must be self-contained, independently testable, documented; Clear purpose required - no organizational-only libraries -->
+### 代码整洁原则
+代码必须保持整洁，格式统一，遵循一致的编码风格，消除冗余和重复代码。
 
-### [PRINCIPLE_2_NAME]
-<!-- Example: II. CLI Interface -->
-[PRINCIPLE_2_DESCRIPTION]
-<!-- Example: Every library exposes functionality via CLI; Text in/out protocol: stdin/args → stdout, errors → stderr; Support JSON + human-readable formats -->
+### 架构清晰原则
+系统架构必须逻辑清晰，模块划分合理，各组件职责明确，易于理解和维护。
 
-### [PRINCIPLE_3_NAME]
-<!-- Example: III. Test-First (NON-NEGOTIABLE) -->
-[PRINCIPLE_3_DESCRIPTION]
-<!-- Example: TDD mandatory: Tests written → User approved → Tests fail → Then implement; Red-Green-Refactor cycle strictly enforced -->
+### 注释完整原则
+所有关键代码必须配备完整注释，包括函数功能、参数说明、返回值描述及特殊情况处理。
 
-### [PRINCIPLE_4_NAME]
-<!-- Example: IV. Integration Testing -->
-[PRINCIPLE_4_DESCRIPTION]
-<!-- Example: Focus areas requiring integration tests: New library contract tests, Contract changes, Inter-service communication, Shared schemas -->
+### 文档中文化原则
+所有技术文档、API说明、用户指南等必须使用中文编写，确保团队成员无障碍理解。
 
-### [PRINCIPLE_5_NAME]
-<!-- Example: V. Observability, VI. Versioning & Breaking Changes, VII. Simplicity -->
-[PRINCIPLE_5_DESCRIPTION]
-<!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
+### 可维护性原则
+代码设计必须考虑长期维护需求，具有良好的扩展性和可修改性，降低后期维护成本。
 
-## [SECTION_2_NAME]
-<!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
+## 开发约束
 
-[SECTION_2_CONTENT]
-<!-- Example: Technology stack requirements, compliance standards, deployment policies, etc. -->
+所有代码提交前必须通过静态代码分析工具检查，确保符合质量标准。单元测试覆盖率不得低于80%，关键业务逻辑需达到95%以上覆盖率。
 
-## [SECTION_3_NAME]
-<!-- Example: Development Workflow, Review Process, Quality Gates, etc. -->
+## 工作流程
 
-[SECTION_3_CONTENT]
-<!-- Example: Code review requirements, testing gates, deployment approval process, etc. -->
+采用代码审查机制，所有功能提交必须经过至少一名同事的代码审查。实现TDD（测试驱动开发）模式，先写测试再实现功能，确保代码质量和功能正确性。
 
 ## Governance
-<!-- Example: Constitution supersedes all other practices; Amendments require documentation, approval, migration plan -->
 
-[GOVERNANCE_RULES]
-<!-- Example: All PRs/reviews must verify compliance; Complexity must be justified; Use [GUIDANCE_FILE] for runtime development guidance -->
+本宪法为项目开发的最高指导原则，所有开发活动必须遵守。任何违反宪法的行为都需要提供特殊理由并获得团队认可。版本迭代过程中必须保持向后兼容性，重大变更需要充分评估和规划迁移方案。
 
-**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: [LAST_AMENDED_DATE]
-<!-- Example: Version: 2.1.1 | Ratified: 2025-06-13 | Last Amended: 2025-07-16 -->
+**Version**: 1.0.0 | **Ratified**: 2026-02-09 | **Last Amended**: 2026-02-09

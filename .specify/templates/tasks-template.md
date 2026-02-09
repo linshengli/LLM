@@ -151,7 +151,10 @@ Examples of foundational tasks (adjust based on your project):
 **Purpose**: Improvements that affect multiple user stories
 
 - [ ] TXXX [P] Documentation updates in docs/
-- [ ] TXXX Code cleanup and refactoring
+- [ ] TXXX Code cleanup and refactoring to meet constitutional code cleanliness standards
+- [ ] TXXX Architecture review for clarity and proper modularization
+- [ ] TXXX Add missing code comments to satisfy constitutional completeness requirements
+- [ ] TXXX Ensure all documentation is in Chinese as per constitutional mandate
 - [ ] TXXX Performance optimization across all stories
 - [ ] TXXX [P] Additional unit tests (if requested) in tests/unit/
 - [ ] TXXX Security hardening

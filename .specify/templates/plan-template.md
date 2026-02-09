@@ -31,7 +31,12 @@
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-[Gates determined based on constitution file]
+根据SpecKit宪法检查：
+- 代码整洁原则：确保设计符合整洁代码标准
+- 架构清晰原则：验证系统架构逻辑清晰，模块划分合理
+- 注释完整原则：确保关键组件具备完整文档说明
+- 文档中文化原则：所有设计文档使用中文撰写
+- 可维护性原则：设计应考虑长期维护需求，具有良好的扩展性
 
 ## Project Structure
 

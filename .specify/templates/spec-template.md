@@ -82,6 +82,13 @@
   Fill them out with the right functional requirements.
 -->
 
+遵从SpecKit宪法原则：
+- 代码必须保持整洁，格式统一，遵循一致的编码风格
+- 系统架构必须逻辑清晰，模块划分合理
+- 所有关键代码必须配备完整注释
+- 所有技术文档必须使用中文编写
+- 代码设计必须考虑长期维护需求
+
 ### Functional Requirements
 
 - **FR-001**: System MUST [specific capability, e.g., "allow users to create accounts"]
