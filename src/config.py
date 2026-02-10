@@ -69,3 +69,6 @@ class TrainingConfig:
     log_interval: int = 50          # 日志打印步数间隔
     eval_interval: int = 500        # 验证评估步数间隔
     save_interval: int = 1000       # 检查点保存步数间隔
+    # 蒸馏 KL 的显存优化：对 vocab 维度分块计算，避免一次性构造 (B,S,V) 级别的 probs/log_probs 临时张量
+    use_chunked_kl: bool = True
+    kl_chunk_size: int = 4096

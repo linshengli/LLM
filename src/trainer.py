@@ -27,12 +27,90 @@ from src.model import StudentModel
 logger = logging.getLogger(__name__)
 
 
+def _kl_div_teacher_student_chunked(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    temperature: float,
+    labels: Optional[torch.Tensor] = None,
+    ignore_index: int = -100,
+    chunk_size: int = 4096,
+) -> torch.Tensor:
+    """按 vocab 分块计算 KL(teacher || student)，降低峰值显存。
+
+    等价于:
+      KL = mean_tokens sum_v p_t(v) * (log p_t(v) - log p_s(v))
+    其中 p_t = softmax(teacher_logits/T), p_s = softmax(student_logits/T)。
+
+    关键点: 不显式构造 (B,S,V) 的 teacher_probs / student_log_probs。
+    """
+    if student_logits.shape != teacher_logits.shape:
+        raise ValueError(
+            f"student_logits shape {tuple(student_logits.shape)} != "
+            f"teacher_logits shape {tuple(teacher_logits.shape)}"
+        )
+    if student_logits.dim() != 3:
+        raise ValueError(f"expected logits dim=3, got {student_logits.dim()}")
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+
+    bsz, seqlen, vocab = student_logits.shape
+    device = student_logits.device
+
+    token_mask = None
+    if labels is not None:
+        if labels.shape != (bsz, seqlen):
+            raise ValueError(f"labels shape {tuple(labels.shape)} != {(bsz, seqlen)}")
+        token_mask = labels.ne(ignore_index)  # (B,S)
+
+    # 先算 max(logits) (unscaled). 利用: max(x/T) == max(x)/T (T>0) 避免分配 x/T 张量。
+    s_max = student_logits.max(dim=-1).values  # (B,S)
+    t_max = teacher_logits.max(dim=-1).values  # (B,S)
+
+    inv_t = 1.0 / float(temperature)
+
+    # log denom: log(sum(exp((x - max)/T)))，用 float32 分块累加 sumexp，避免整块 float32 拷贝。
+    s_sumexp = torch.zeros((bsz, seqlen), device=device, dtype=torch.float32)
+    t_sumexp = torch.zeros((bsz, seqlen), device=device, dtype=torch.float32)
+    for start in range(0, vocab, chunk_size):
+        end = min(start + chunk_size, vocab)
+        s_chunk = student_logits[..., start:end]
+        t_chunk = teacher_logits[..., start:end]
+        s_sumexp += torch.exp(((s_chunk - s_max.unsqueeze(-1)) * inv_t).float()).sum(dim=-1)
+        t_sumexp += torch.exp(((t_chunk - t_max.unsqueeze(-1)) * inv_t).float()).sum(dim=-1)
+    s_log_denom = torch.log(s_sumexp)  # (B,S)
+    t_log_denom = torch.log(t_sumexp)  # (B,S)
+
+    kl_per_token = torch.zeros((bsz, seqlen), device=device, dtype=torch.float32)
+    for start in range(0, vocab, chunk_size):
+        end = min(start + chunk_size, vocab)
+        s_chunk = student_logits[..., start:end]
+        t_chunk = teacher_logits[..., start:end]
+
+        log_p_s = ((s_chunk - s_max.unsqueeze(-1)) * inv_t).float() - s_log_denom.unsqueeze(-1)
+        log_p_t = ((t_chunk - t_max.unsqueeze(-1)) * inv_t).float() - t_log_denom.unsqueeze(-1)
+        p_t = torch.exp(log_p_t)
+        kl_per_token += (p_t * (log_p_t - log_p_s)).sum(dim=-1)
+
+    if token_mask is not None:
+        kl_per_token = kl_per_token.masked_fill(~token_mask, 0.0)
+        denom = token_mask.sum().clamp(min=1).to(torch.float32)
+    else:
+        denom = torch.tensor(bsz * seqlen, device=device, dtype=torch.float32)
+
+    # reduction="batchmean" on (B*S,V) => mean over tokens.
+    return kl_per_token.sum() / denom
+
+
 def distillation_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
     labels: torch.Tensor,
     alpha: float = 0.5,
     temperature: float = 2.0,
+    use_chunked_kl: bool = True,
+    kl_chunk_size: int = 4096,
 ) -> tuple[torch.Tensor, dict]:
     """计算蒸馏损失。
 
@@ -54,15 +132,26 @@ def distillation_loss(
     vocab_size = student_logits.size(-1)
 
     # KL 散度损失：比较温度缩放后的软化分布
-    # log_softmax(student/T) 与 softmax(teacher/T)
-    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
-    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
-    # KL(P || Q) = sum(P * (log(P) - log(Q)))，这里 P=teacher, Q=student
-    kl_loss = F.kl_div(
-        student_log_probs.view(-1, vocab_size),
-        teacher_probs.view(-1, vocab_size),
-        reduction="batchmean",
-    )
+    # 默认走分块版本，避免 log_softmax/softmax 产生 (B,S,V) 的大临时张量导致 OOM。
+    if use_chunked_kl:
+        kl_loss = _kl_div_teacher_student_chunked(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            temperature=temperature,
+            labels=labels,
+            ignore_index=-100,
+            chunk_size=kl_chunk_size,
+        )
+    else:
+        # log_softmax(student/T) 与 softmax(teacher/T)
+        student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+        teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+        # KL(P || Q) = sum(P * (log(P) - log(Q)))，这里 P=teacher, Q=student
+        kl_loss = F.kl_div(
+            student_log_probs.view(-1, vocab_size),
+            teacher_probs.view(-1, vocab_size),
+            reduction="batchmean",
+        )
 
     # 交叉熵损失：学生预测 vs 真实标签
     # ignore_index=-100 忽略 labels 中的填充位置
@@ -206,10 +295,12 @@ class DistillationTrainer:
                 # 计算蒸馏损失
                 loss, metrics = distillation_loss(
                     student_logits,
-                    teacher_logits.float(),  # 教师 FP16 → FP32
+                    teacher_logits,
                     labels,
                     alpha=self.config.alpha,
                     temperature=self.config.temperature,
+                    use_chunked_kl=getattr(self.config, "use_chunked_kl", True),
+                    kl_chunk_size=getattr(self.config, "kl_chunk_size", 4096),
                 )
 
                 # 反向传播
@@ -300,10 +391,12 @@ class DistillationTrainer:
                 student_logits = self.student(input_ids)
                 loss, _ = distillation_loss(
                     student_logits,
-                    teacher_logits.float(),
+                    teacher_logits,
                     labels,
                     alpha=self.config.alpha,
                     temperature=self.config.temperature,
+                    use_chunked_kl=getattr(self.config, "use_chunked_kl", True),
+                    kl_chunk_size=getattr(self.config, "kl_chunk_size", 4096),
                 )
                 total_loss += loss.item()
                 num_batches += 1
