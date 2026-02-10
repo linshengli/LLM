@@ -1,0 +1,345 @@
+# -*- coding: utf-8 -*-
+"""
+知识蒸馏训练模块。
+
+实现标准的 logit-level 知识蒸馏训练循环：
+- 教师模型（Qwen2.5-0.5B）提供软标签（soft labels）
+- 学生模型同时学习教师知识（KL 散度）和真实标签（交叉熵）
+- 支持检查点保存/加载，可从中断处恢复训练
+"""
+
+import os
+import math
+import logging
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM
+
+from src.config import TrainingConfig
+from src.model import StudentModel
+
+logger = logging.getLogger(__name__)
+
+
+def distillation_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    labels: torch.Tensor,
+    alpha: float = 0.5,
+    temperature: float = 2.0,
+) -> tuple[torch.Tensor, dict]:
+    """计算蒸馏损失。
+
+    公式: L = α * T² * KL(softmax(s/T) || softmax(t/T)) + (1-α) * CE(s, labels)
+
+    KL 散度衡量学生与教师输出分布的差异（软标签知识）。
+    交叉熵确保学生也学习真实标签（硬标签监督）。
+    T² 缩放因子补偿温度对梯度的缩放效应（Hinton et al. 2015）。
+
+    参数:
+        student_logits: 学生模型输出, shape (batch, seq_len, vocab_size)
+        teacher_logits: 教师模型输出, shape (batch, seq_len, vocab_size)
+        labels: 目标标签, shape (batch, seq_len)
+        alpha: 蒸馏损失权重（0=纯 CE, 1=纯 KL）
+        temperature: 蒸馏温度（越高分布越平滑，暴露更多教师知识）
+    返回:
+        (total_loss, {"kl_loss": float, "ce_loss": float, "total_loss": float})
+    """
+    vocab_size = student_logits.size(-1)
+
+    # KL 散度损失：比较温度缩放后的软化分布
+    # log_softmax(student/T) 与 softmax(teacher/T)
+    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+    # KL(P || Q) = sum(P * (log(P) - log(Q)))，这里 P=teacher, Q=student
+    kl_loss = F.kl_div(
+        student_log_probs.view(-1, vocab_size),
+        teacher_probs.view(-1, vocab_size),
+        reduction="batchmean",
+    )
+
+    # 交叉熵损失：学生预测 vs 真实标签
+    # ignore_index=-100 忽略 labels 中的填充位置
+    ce_loss = F.cross_entropy(
+        student_logits.view(-1, vocab_size),
+        labels.view(-1),
+        ignore_index=-100,
+    )
+
+    # 加权组合: α·T²·KL + (1-α)·CE
+    total_loss = alpha * (temperature ** 2) * kl_loss + (1 - alpha) * ce_loss
+
+    metrics = {
+        "kl_loss": kl_loss.item(),
+        "ce_loss": ce_loss.item(),
+        "total_loss": total_loss.item(),
+    }
+    return total_loss, metrics
+
+
+def load_teacher_model(
+    model_id: str = "Qwen/Qwen2.5-0.5B",
+    device: torch.device = torch.device("cuda"),
+) -> nn.Module:
+    """加载教师模型（FP16, eval mode, 冻结参数）。
+
+    参数:
+        model_id: HuggingFace 模型 ID
+        device: 目标设备
+    返回:
+        冻结的教师模型实例
+    """
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    model.eval()
+    # 冻结所有参数，教师模型不参与梯度更新
+    for param in model.parameters():
+        param.requires_grad_(False)
+    model.to(device)
+    return model
+
+
+def _get_cosine_schedule_with_warmup(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    total_steps: int,
+    min_lr_ratio: float = 0.033,  # lr_min / lr ≈ 1e-5 / 3e-4
+) -> LambdaLR:
+    """创建带线性预热的余弦退火学习率调度器。"""
+    def lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            # 线性预热
+            return current_step / max(1, warmup_steps)
+        # 余弦退火
+        progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+    return LambdaLR(optimizer, lr_lambda)
+
+
+class DistillationTrainer:
+    """知识蒸馏训练管理器。
+
+    管理完整的训练生命周期：优化器初始化、训练循环、验证评估、检查点保存/加载。
+    """
+
+    def __init__(
+        self,
+        student_model: StudentModel,
+        teacher_model: nn.Module,
+        train_loader,
+        val_loader,
+        config: TrainingConfig,
+        device: torch.device,
+    ):
+        """
+        初始化训练器，创建优化器和学习率调度器。
+        教师模型设置为 eval 模式且冻结参数。
+        """
+        self.student = student_model.to(device)
+        self.teacher = teacher_model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.config = config
+        self.device = device
+
+        # 确保教师模型冻结
+        self.teacher.eval()
+        for p in self.teacher.parameters():
+            p.requires_grad_(False)
+
+        # AdamW 优化器
+        self.optimizer = AdamW(
+            self.student.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+
+        # 余弦退火学习率调度器
+        total_steps = config.num_epochs * len(train_loader)
+        self.scheduler = _get_cosine_schedule_with_warmup(
+            self.optimizer, config.warmup_steps, total_steps
+        )
+
+        # 训练状态
+        self.epoch = 0
+        self.step = 0
+        self.best_val_loss = float("inf")
+
+    def train(self) -> dict:
+        """执行完整训练流程。
+
+        返回:
+            训练历史 {"train_loss": [...], "val_loss": [...], "val_ppl": [...]}
+        """
+        history = {"train_loss": [], "val_loss": [], "val_ppl": []}
+
+        for epoch in range(self.epoch, self.config.num_epochs):
+            self.epoch = epoch
+            self.student.train()
+
+            for batch in self.train_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                labels = batch["labels"].to(self.device)
+
+                # 教师前向传播（不计算梯度）
+                with torch.no_grad():
+                    teacher_outputs = self.teacher(input_ids)
+                    # 兼容 HuggingFace 模型输出（有 .logits 属性）和普通张量
+                    teacher_logits = (
+                        teacher_outputs.logits
+                        if hasattr(teacher_outputs, "logits")
+                        else teacher_outputs
+                    )
+
+                # 学生前向传播
+                student_logits = self.student(input_ids)
+
+                # 计算蒸馏损失
+                loss, metrics = distillation_loss(
+                    student_logits,
+                    teacher_logits.float(),  # 教师 FP16 → FP32
+                    labels,
+                    alpha=self.config.alpha,
+                    temperature=self.config.temperature,
+                )
+
+                # 反向传播
+                self.optimizer.zero_grad()
+                loss.backward()
+
+                # NaN/Inf 梯度检测
+                has_nan = False
+                for name, param in self.student.named_parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                            logger.warning(f"步骤 {self.step}: {name} 梯度中检测到 NaN/Inf")
+                            has_nan = True
+
+                if not has_nan:
+                    # 梯度裁剪
+                    torch.nn.utils.clip_grad_norm_(
+                        self.student.parameters(), self.config.gradient_clip
+                    )
+                    self.optimizer.step()
+                    self.scheduler.step()
+
+                self.step += 1
+                history["train_loss"].append(metrics["total_loss"])
+
+                # 日志输出
+                if self.step % self.config.log_interval == 0:
+                    lr = self.scheduler.get_last_lr()[0]
+                    print(
+                        f"Epoch {epoch+1} | Step {self.step} | "
+                        f"Loss: {metrics['total_loss']:.4f} | "
+                        f"KL: {metrics['kl_loss']:.4f} | "
+                        f"CE: {metrics['ce_loss']:.4f} | "
+                        f"LR: {lr:.2e}"
+                    )
+
+                # 验证评估
+                if self.step % self.config.eval_interval == 0:
+                    val_metrics = self.evaluate()
+                    history["val_loss"].append(val_metrics["val_loss"])
+                    history["val_ppl"].append(val_metrics["val_ppl"])
+                    print(
+                        f"  验证 | Loss: {val_metrics['val_loss']:.4f} | "
+                        f"PPL: {val_metrics['val_ppl']:.2f}"
+                    )
+                    if val_metrics["val_loss"] < self.best_val_loss:
+                        self.best_val_loss = val_metrics["val_loss"]
+                        best_path = os.path.join(self.config.checkpoint_dir, "best.pt")
+                        self.save_checkpoint(best_path)
+                        print(f"  新最佳模型已保存: val_loss={self.best_val_loss:.4f}")
+
+                # 定期保存检查点
+                if self.step % self.config.save_interval == 0:
+                    ckpt_path = os.path.join(
+                        self.config.checkpoint_dir, f"checkpoint_step{self.step}.pt"
+                    )
+                    self.save_checkpoint(ckpt_path)
+
+        # 训练结束保存最终检查点
+        final_path = os.path.join(self.config.checkpoint_dir, "final.pt")
+        self.save_checkpoint(final_path)
+        print(f"训练完成。最终检查点已保存至 {final_path}")
+
+        return history
+
+    def evaluate(self) -> dict:
+        """在验证集上评估模型。
+
+        返回:
+            {"val_loss": float, "val_ppl": float}
+        """
+        self.student.eval()
+        total_loss = 0.0
+        num_batches = 0
+
+        with torch.no_grad():
+            for batch in self.val_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                labels = batch["labels"].to(self.device)
+
+                teacher_outputs = self.teacher(input_ids)
+                teacher_logits = (
+                    teacher_outputs.logits
+                    if hasattr(teacher_outputs, "logits")
+                    else teacher_outputs
+                )
+
+                student_logits = self.student(input_ids)
+                loss, _ = distillation_loss(
+                    student_logits,
+                    teacher_logits.float(),
+                    labels,
+                    alpha=self.config.alpha,
+                    temperature=self.config.temperature,
+                )
+                total_loss += loss.item()
+                num_batches += 1
+
+        self.student.train()
+
+        avg_loss = total_loss / max(num_batches, 1)
+        ppl = math.exp(min(avg_loss, 100))  # 防止 exp 溢出
+        return {"val_loss": avg_loss, "val_ppl": ppl}
+
+    def save_checkpoint(self, path: str) -> None:
+        """保存训练检查点。
+
+        保存内容: 模型权重、优化器状态、调度器状态、训练进度
+        """
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+        checkpoint = {
+            "model_state_dict": self.student.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "epoch": self.epoch,
+            "step": self.step,
+            "best_val_loss": self.best_val_loss,
+            "config": self.config,
+        }
+        torch.save(checkpoint, path)
+
+    def load_checkpoint(self, path: str) -> None:
+        """从检查点恢复训练状态。
+
+        恢复: 模型权重、优化器状态、调度器状态、训练进度
+        """
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        self.student.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        self.epoch = checkpoint["epoch"]
+        self.step = checkpoint["step"]
+        self.best_val_loss = checkpoint["best_val_loss"]

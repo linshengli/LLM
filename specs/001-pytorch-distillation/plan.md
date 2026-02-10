@@ -2,7 +2,7 @@
 
 **Branch**: `001-pytorch-distillation` | **Date**: 2026-02-09 | **Spec**: [spec.md](./spec.md)
 **Input**: Feature specification from `/specs/001-pytorch-distillation/spec.md`
-**Scope**: Phase 1 only（模型架构实现）
+**Scope**: 完整（US1 模型架构 + US2 数据准备 + US3 蒸馏训练 + US4 推理生成）
 
 ## Summary
 
@@ -99,6 +99,89 @@ notebooks/
 ### 快速启动
 
 详见 [quickstart.md](./quickstart.md)。
+
+## Phase 2: User Story 2 — 数据准备与 Tokenizer 集成
+
+### 设计要点
+
+**数据流**: HuggingFace `wikipedia/20231101.zh` → 文本提取 → Tokenizer 编码 → 拼接 → 按 seq_len=512 分块 → input_ids/labels 对 → DataLoader
+
+**关键设计决策**:
+
+1. **Tokenizer 来源**: 直接复用 Qwen2.5-0.5B 的 AutoTokenizer（vocab_size=151936），无需训练自定义 Tokenizer
+2. **数据预处理策略**: 文本拼接法（concatenate-then-chunk）— 将所有文章 token 拼接为一维长序列，再按固定 seq_len 切分，避免短文本填充浪费
+3. **Labels 构造**: 因果语言建模标准做法，labels = input_ids 右移一位，首位填充 -100（cross_entropy 会忽略该位置）
+4. **数据集拆分**: 90% 训练 / 10% 验证，通过取前 N 条原始文章控制总量在 ~50MB
+5. **pad_token 处理**: Qwen2.5 Tokenizer 默认无 pad_token，需设置 pad_token = eos_token
+
+### 显存与性能注意事项
+
+- 数据预处理在 CPU 上完成，不占用 GPU 显存
+- DataLoader 使用 num_workers=2（Colab 限制），pin_memory=True
+- 预处理后的数据集缓存到内存（~50MB token 数据完全放得下）
+
+### 与 Phase 1 的接口
+
+- **依赖 Phase 1**: ModelConfig.max_seq_len 和 ModelConfig.vocab_size 决定数据分块长度和 Tokenizer 兼容性
+- **下游消费者**: Phase 3 (DistillationTrainer) 的 train_loader/val_loader
+
+## Phase 3: User Story 3 — 知识蒸馏训练
+
+### 设计要点
+
+**训练流**: 加载教师模型(FP16) → 加载学生模型(FP32) → 训练循环(在线蒸馏) → 检查点保存 → 验证评估
+
+**关键设计决策**:
+
+1. **蒸馏损失**: L = α·T²·KL(softmax(s/T) ‖ softmax(t/T)) + (1-α)·CE(s, labels)，α=0.5, T=2.0
+2. **教师模型加载**: AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B", torch_dtype=float16)，设 eval() 并冻结全部参数
+3. **优化器**: AdamW(lr=3e-4, weight_decay=0.01) + cosine scheduler with warmup
+4. **检查点策略**: 每 save_interval 步保存完整状态（模型、优化器、scheduler、epoch/step、best_val_loss）
+5. **梯度安全**: gradient clipping=1.0，NaN/Inf 检测与警告日志
+6. **评估指标**: 验证集 loss + perplexity (ppl = exp(loss))
+
+### 显存运行时分析
+
+教师模型前向传播使用 `torch.no_grad()` 且 FP16，不产生计算图。学生模型 FP32 训练。总显存预计 ~9-11GB，T4 15GB 留有余量。
+
+### 与前置 Phase 的接口
+
+- **依赖 Phase 1**: StudentModel (model.py)
+- **依赖 Phase 2**: train_loader, val_loader (data.py), load_tokenizer
+- **下游消费者**: Phase 4 (TextGenerator) 加载训练后的检查点
+
+## Phase 4: User Story 4 — 模型推理与文本生成
+
+### 设计要点
+
+**推理流**: 加载检查点 → 构建 StudentModel(eval) → 编码 prompt → 自回归生成 → 解码输出
+
+**关键设计决策**:
+
+1. **解码策略**: 支持 greedy（argmax）、top-k（筛选前 k 个 token 再采样）、top-p/nucleus（累积概率阈值采样）
+2. **温度控制**: temperature 参数缩放 logits，<1 更确定，>1 更随机（仅采样策略生效）
+3. **停止条件**: 达到 max_new_tokens 或生成 eos_token
+4. **模型加载**: 从检查点中提取 model_state_dict，加载到新建的 StudentModel 实例
+
+### 与前置 Phase 的接口
+
+- **依赖 Phase 1**: StudentModel, ModelConfig
+- **依赖 Phase 2**: load_tokenizer
+- **依赖 Phase 3**: 训练后的检查点文件
+
+## Phase 5: 集成与 Notebook
+
+### Colab 主 Notebook (notebooks/main.ipynb)
+
+**Cell 顺序**:
+1. 环境检查 & pip install
+2. 从 src/ 导入所有模块
+3. 加载 Tokenizer & 构建数据集
+4. 构建学生模型 & 打印参数量
+5. 加载教师模型 & 显存检查
+6. 执行蒸馏训练 & 绘制 loss 曲线
+7. 文本生成演示（多种解码策略对比）
+8. 保存最终模型到 Google Drive
 
 ## Complexity Tracking
 
