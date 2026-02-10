@@ -21,7 +21,9 @@ class ModelConfig:
     num_heads: int = 8              # 注意力头数（Q 头数）
     num_kv_heads: int = 2           # KV 头数（GQA 分组）
     intermediate_size: int = 2048   # SwiGLU FFN 中间维度
-    vocab_size: int = 151665        # 词表大小（与 Qwen2.5-0.5B Tokenizer 一致）
+    # 词表大小（embedding/lm_head 输出维度），需与教师模型 logits 的最后一维一致。
+    # 注意: 这可能与 len(tokenizer) 略有差异，但蒸馏时必须对齐 teacher 的 vocab 维度。
+    vocab_size: int = 151936
     max_seq_len: int = 512          # 最大序列长度
     rope_theta: float = 1000000.0   # RoPE 旋转基数
     norm_eps: float = 1e-6          # RMSNorm epsilon

@@ -245,6 +245,15 @@ class DistillationTrainer:
         for p in self.teacher.parameters():
             p.requires_grad_(False)
 
+        # 蒸馏要求 teacher/student logits 的 vocab 维度一致，否则 KL/CE 计算会直接报错。
+        teacher_vocab = getattr(getattr(self.teacher, "config", None), "vocab_size", None)
+        student_vocab = getattr(getattr(self.student, "config", None), "vocab_size", None)
+        if teacher_vocab is not None and student_vocab is not None and teacher_vocab != student_vocab:
+            raise ValueError(
+                f"teacher vocab_size ({teacher_vocab}) != student vocab_size ({student_vocab}). "
+                "请用 teacher.config.vocab_size 构造 ModelConfig(vocab_size=...) 后重建 StudentModel。"
+            )
+
         # AdamW 优化器
         self.optimizer = AdamW(
             self.student.parameters(),

@@ -15,7 +15,7 @@ class TestModelConfig:
         assert config.num_heads == 8
         assert config.num_kv_heads == 2
         assert config.intermediate_size == 2048
-        assert config.vocab_size == 151665
+        assert config.vocab_size == 151936
         assert config.max_seq_len == 512
         assert config.rope_theta == 1000000.0
         assert config.norm_eps == 1e-6
@@ -72,3 +72,5 @@ class TestTrainingConfig:
         assert config.log_interval == 50
         assert config.eval_interval == 500
         assert config.save_interval == 1000
+        assert config.use_chunked_kl is True
+        assert config.kl_chunk_size == 4096
