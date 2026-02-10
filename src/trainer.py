@@ -289,8 +289,20 @@ class DistillationTrainer:
                 labels = batch["labels"].to(self.device)
 
                 # 教师前向传播（不计算梯度）
-                with torch.no_grad():
-                    teacher_outputs = self.teacher(input_ids)
+                # 关键：对 HF CausalLM 禁用 use_cache（past_key_values），否则会额外分配大量 KV cache 显存。
+                # inference_mode 比 no_grad 更省内存/更快（不记录版本计数等），适合纯推理的 teacher。
+                with torch.inference_mode():
+                    try:
+                        teacher_outputs = self.teacher(
+                            input_ids,
+                            use_cache=False,
+                            output_hidden_states=False,
+                            output_attentions=False,
+                            return_dict=True,
+                        )
+                    except TypeError:
+                        # 兼容非 HF 模型或不支持上述参数的 teacher
+                        teacher_outputs = self.teacher(input_ids)
                     # 兼容 HuggingFace 模型输出（有 .logits 属性）和普通张量
                     teacher_logits = (
                         teacher_outputs.logits
@@ -311,6 +323,8 @@ class DistillationTrainer:
                     use_chunked_kl=getattr(self.config, "use_chunked_kl", True),
                     kl_chunk_size=getattr(self.config, "kl_chunk_size", 4096),
                 )
+                # teacher_logits/outputs 不参与反传，尽早释放引用以降低峰值（显存由缓存分配器复用，不一定立刻回到系统）。
+                del teacher_outputs, teacher_logits
 
                 # 反向传播
                 self.optimizer.zero_grad()
@@ -385,12 +399,21 @@ class DistillationTrainer:
         total_loss = 0.0
         num_batches = 0
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in self.val_loader:
                 input_ids = batch["input_ids"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
-                teacher_outputs = self.teacher(input_ids)
+                try:
+                    teacher_outputs = self.teacher(
+                        input_ids,
+                        use_cache=False,
+                        output_hidden_states=False,
+                        output_attentions=False,
+                        return_dict=True,
+                    )
+                except TypeError:
+                    teacher_outputs = self.teacher(input_ids)
                 teacher_logits = (
                     teacher_outputs.logits
                     if hasattr(teacher_outputs, "logits")
@@ -409,6 +432,7 @@ class DistillationTrainer:
                 )
                 total_loss += loss.item()
                 num_batches += 1
+                del teacher_outputs, teacher_logits, student_logits
 
         self.student.train()
 
