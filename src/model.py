@@ -19,6 +19,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.config import ModelConfig
+from src.optimizers.api import resolve_profile
+from src.optimizers.config_manager import OptimizationProfile
 
 
 class RMSNorm(nn.Module):
@@ -261,13 +263,36 @@ class TransformerBlock(nn.Module):
     结构: x → norm → attention → + residual → norm → ffn → + residual
     """
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, opt: Optional[OptimizationProfile] = None):
         """包含 attention_norm → attention → ffn_norm → ffn 的 pre-norm 结构。"""
         super().__init__()
+        opt = resolve_profile(opt)
         self.attention_norm = RMSNorm(config.hidden_size, config.norm_eps)
-        self.attention = GQAAttention(config)
+        if opt.mla is not None and getattr(opt.mla, "enabled", False):
+            from src.optimizers.mla import MLAAttention
+
+            self.attention = MLAAttention(
+                hidden_size=config.hidden_size,
+                num_heads=config.num_heads,
+                num_kv_heads=config.num_kv_heads,
+                head_dim=config.head_dim,
+                max_seq_len=config.max_seq_len,
+                rope_theta=config.rope_theta,
+                cfg=opt.mla,
+            )
+        else:
+            self.attention = GQAAttention(config)
         self.ffn_norm = RMSNorm(config.hidden_size, config.norm_eps)
-        self.ffn = SwiGLUFFN(config.hidden_size, config.intermediate_size)
+        if opt.moe is not None and getattr(opt.moe, "enabled", False):
+            from src.optimizers.moe import MOERouter
+
+            self.ffn = MOERouter(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                cfg=opt.moe,
+            )
+        else:
+            self.ffn = SwiGLUFFN(config.hidden_size, config.intermediate_size)
 
     def forward(
         self,
@@ -282,7 +307,11 @@ class TransformerBlock(nn.Module):
         # 注意力子层 + 残差
         x = x + self.attention(self.attention_norm(x), position_ids, attention_mask)
         # FFN 子层 + 残差
-        x = x + self.ffn(self.ffn_norm(x))
+        ffn_out = self.ffn(self.ffn_norm(x))
+        # MoE 返回结构化输出
+        if hasattr(ffn_out, "y"):
+            ffn_out = ffn_out.y
+        x = x + ffn_out
         return x
 
 
@@ -293,7 +322,7 @@ class StudentModel(nn.Module):
     与 Qwen2.5 对齐的特性：GQA、RoPE、SwiGLU FFN、RMSNorm、权重共享
     """
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, optimization: Optional[OptimizationProfile] = None):
         """
         初始化 embedding → transformer_blocks × N → final_norm → lm_head。
         lm_head 与 embedding 权重共享（减少参数量）。
@@ -305,7 +334,7 @@ class StudentModel(nn.Module):
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         # N 层 Transformer 解码器
         self.layers = nn.ModuleList(
-            [TransformerBlock(config) for _ in range(config.num_layers)]
+            [TransformerBlock(config, opt=optimization) for _ in range(config.num_layers)]
         )
         # 最终归一化层
         self.norm = RMSNorm(config.hidden_size, config.norm_eps)

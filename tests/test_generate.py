@@ -3,8 +3,9 @@
 import os
 import tempfile
 
-import torch
 import pytest
+
+torch = pytest.importorskip("torch")
 
 from src.config import ModelConfig
 from src.model import StudentModel

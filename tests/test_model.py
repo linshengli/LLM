@@ -1,7 +1,9 @@
 """模型架构测试 — 验证所有 Transformer 组件的正确性。"""
 
-import torch
 import pytest
+
+torch = pytest.importorskip("torch")
+
 from src.config import ModelConfig
 from src.model import (
     RMSNorm,

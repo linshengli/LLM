@@ -1,7 +1,9 @@
 """数据管道测试 — 验证 Tokenizer 加载、数据集构建和 DataLoader 输出。"""
 
-import torch
 import pytest
+
+torch = pytest.importorskip("torch")
+
 from src.config import ModelConfig, TrainingConfig
 from src.data import load_tokenizer, WikiDataset, create_dataloaders
 

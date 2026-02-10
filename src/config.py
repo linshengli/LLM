@@ -24,7 +24,7 @@ class ModelConfig:
     # 词表大小（embedding/lm_head 输出维度），需与教师模型 logits 的最后一维一致。
     # 注意: 这可能与 len(tokenizer) 略有差异，但蒸馏时必须对齐 teacher 的 vocab 维度。
     vocab_size: int = 151936
-    max_seq_len: int = 256          # 最大序列长度
+    max_seq_len: int = 512          # 最大序列长度
     rope_theta: float = 1000000.0   # RoPE 旋转基数
     norm_eps: float = 1e-6          # RMSNorm epsilon
     dropout: float = 0.0            # Dropout 率（蒸馏时通常为 0）
@@ -59,7 +59,7 @@ class TrainingConfig:
     定义知识蒸馏训练过程中的所有可调参数。
     """
 
-    batch_size: int = 2             # 批大小
+    batch_size: int = 8             # 批大小
     learning_rate: float = 3e-4     # 初始学习率
     weight_decay: float = 0.01      # 权重衰减
     warmup_steps: int = 500         # 学习率线性预热步数
